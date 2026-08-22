@@ -14,6 +14,16 @@ Features
    between Alice and Bob: private scalar selection, public point derivation,
    public key exchange, and verification of the identical shared secret.
 
+Numerical input policy
+----------------------
+Streamlit's JavaScript rendering engine bounds ``st.number_input`` at
+2^53 - 1, which cryptographic-grade 256-bit parameters far exceed. All
+numeric entry points therefore use ``st.text_input`` widgets parsed through
+:func:`parse_integer_text`, which accepts base-10 and ``0x``-prefixed
+hexadecimal strings, falls back to safe defaults on malformed input, and
+reduces every value modulo the active field characteristic so downstream
+ECC routines only ever receive sanitized native Python integers.
+
 Run with:
     streamlit run app.py
 """
@@ -33,6 +43,16 @@ from ecc_engine import (
 )
 
 # ---------------------------------------------------------------------------
+# Safe fallback literals for every text-entry field
+# ---------------------------------------------------------------------------
+
+PRIME_FALLBACK: str = "97"
+COEFF_A_FALLBACK: str = "2"
+COEFF_B_FALLBACK: str = "3"
+ALICE_FALLBACK: str = "7"
+BOB_FALLBACK: str = "11"
+
+# ---------------------------------------------------------------------------
 # Page configuration and session-state initialisation
 # ---------------------------------------------------------------------------
 
@@ -47,11 +67,82 @@ st.session_state.setdefault("alice_private", 7)
 st.session_state.setdefault("bob_private", 11)
 st.session_state.setdefault("ecdh_result", None)
 
+# Widget-backed keys must exist BEFORE the corresponding st.text_input
+# instantiates; mutating them afterwards raises StreamlitAPIException.
+if "alice_scalar_text" not in st.session_state:
+    st.session_state["alice_scalar_text"] = ALICE_FALLBACK
+if "bob_scalar_text" not in st.session_state:
+    st.session_state["bob_scalar_text"] = BOB_FALLBACK
+
 
 def reset_handshake() -> None:
     """Reset the ECDH workflow to its initial step."""
     st.session_state["ecdh_step"] = 1
     st.session_state["ecdh_result"] = None
+
+
+# ---------------------------------------------------------------------------
+# Text-to-integer parsing pipeline (Streamlit JS bound workaround)
+# ---------------------------------------------------------------------------
+
+
+def parse_integer_text(raw: str, fallback: str) -> tuple[int, bool]:
+    """Convert a text field into a native Python integer.
+
+    Accepts standard base-10 integer strings and hexadecimal strings
+    prefixed with ``0x`` (case-insensitive, optionally signed). Empty or
+    malformed input falls back to the supplied default literal.
+
+    Args:
+        raw: The raw widget string.
+        fallback: A trusted default literal used when parsing fails.
+
+    Returns:
+        A tuple ``(value, is_valid)`` where ``value`` is the parsed
+        integer and ``is_valid`` is False when the fallback was applied.
+    """
+    cleaned: str = raw.strip()
+    if not cleaned:
+        # Empty entry: apply the fallback and flag it so the UI can warn.
+        try:
+            if fallback.lower().startswith("0x"):
+                return int(fallback, 16), False
+            return int(fallback, 10), False
+        except ValueError:  # Defensive: fallback literals are trusted.
+            return 0, False
+    try:
+        if cleaned.lower().lstrip("+-").startswith("0x"):
+            value: int = int(cleaned, 16)
+        else:
+            value = int(cleaned, 10)
+        return value, True
+    except ValueError:
+        try:
+            if fallback.lower().startswith("0x"):
+                return int(fallback, 16), False
+            return int(fallback, 10), False
+        except ValueError:  # Defensive: fallback literals are trusted.
+            return 0, False
+
+
+def sanitize_field_element(value: int, curve_p: int) -> int:
+    """Enforce the modular boundary check ``value % curve_p``."""
+    return value % curve_p
+
+
+def sanitize_scalar(value: int, curve_p: int, bound: int) -> int:
+    """Reduce a private scalar into the valid range ``[1, bound]``.
+
+    The value is first reduced modulo the field characteristic per the
+    modular boundary policy, then folded into the generator-order bound so
+    downstream ECDH routines never receive an out-of-range scalar.
+    """
+    reduced: int = value % curve_p
+    if reduced > bound:
+        reduced %= bound
+    if reduced == 0:
+        reduced = 1
+    return reduced
 
 
 # ---------------------------------------------------------------------------
@@ -91,8 +182,6 @@ curve_mode: str = st.sidebar.segmented_control(
     key="curve_mode",
 )
 
-toy_curve: EllipticCurve = build_curve(2, 3, 97)
-
 if curve_mode == "secp256k1 (standard)":
     active_curve: EllipticCurve = CURVE_SECP256K1
     st.sidebar.caption(
@@ -101,18 +190,51 @@ if curve_mode == "secp256k1 (standard)":
         "the scatter plot is only available for toy fields."
     )
 else:
-    col_a, col_b = st.sidebar.columns(2)
-    coeff_a: int = col_a.number_input(
-        "Coefficient a", min_value=0, max_value=500, value=2, key="coeff_a"
+    # -- Prime modulus entry (text pipeline; exceeds JS number bounds) ------
+    prime_raw: str = st.sidebar.text_input(
+        "Prime p (base-10 or 0x hex)",
+        value=PRIME_FALLBACK,
+        key="prime_text",
     )
-    coeff_b: int = col_b.number_input(
-        "Coefficient b", min_value=0, max_value=500, value=3, key="coeff_b"
+    prime_p: int
+    prime_ok: bool
+    prime_p, prime_ok = parse_integer_text(prime_raw, PRIME_FALLBACK)
+    if not prime_ok:
+        st.sidebar.warning(
+            f"Unparseable prime entry; using fallback p = {prime_p}.",
+            icon=":material/warning:",
+        )
+
+    # -- Coefficient entries, reduced modulo the active prime ----------------
+    coeff_a_raw: str = st.sidebar.text_input(
+        "Coefficient a (base-10 or 0x hex)",
+        value=COEFF_A_FALLBACK,
+        key="coeff_a_text",
     )
-    prime_p: int = st.sidebar.number_input(
-        "Prime p", min_value=11, max_value=997, value=97, key="prime_p"
+    coeff_a_val: int
+    coeff_a_ok: bool
+    coeff_a_val, coeff_a_ok = parse_integer_text(coeff_a_raw, COEFF_A_FALLBACK)
+    coeff_a_val = sanitize_field_element(coeff_a_val, prime_p)
+
+    coeff_b_raw: str = st.sidebar.text_input(
+        "Coefficient b (base-10 or 0x hex)",
+        value=COEFF_B_FALLBACK,
+        key="coeff_b_text",
     )
+    coeff_b_val: int
+    coeff_b_ok: bool
+    coeff_b_val, coeff_b_ok = parse_integer_text(coeff_b_raw, COEFF_B_FALLBACK)
+    coeff_b_val = sanitize_field_element(coeff_b_val, prime_p)
+
+    if not (coeff_a_ok and coeff_b_ok):
+        st.sidebar.warning(
+            "Unparseable coefficient entry; fallback applied and reduced "
+            f"mod {prime_p}.",
+            icon=":material/warning:",
+        )
+
     try:
-        active_curve = build_curve(int(coeff_a), int(coeff_b), int(prime_p))
+        active_curve = build_curve(coeff_a_val, coeff_b_val, prime_p)
     except ValueError as exc:
         st.sidebar.error(f"Invalid curve parameters: {exc}")
         st.stop()
@@ -159,6 +281,8 @@ else:
             points_frame,
             x="x",
             y="y",
+            x_label="x coordinate (mod p)",
+            y_label="y coordinate (mod p)",
             color="#4b7bec",
             height=480,
         )
@@ -212,57 +336,77 @@ else:
 
 exchange: ECDHExchange = ECDHExchange(active_curve, generator=generator_point)
 bound: int = exchange.order_bound
+curve_p: int = active_curve.p
 
-step: int = int(st.session_state["ecdh_step"])
-
-# Progress indicator across the four protocol stages.
-st.progress(min(step, 4) / 4, text=f"Protocol stage {min(step, 4)} of 4")
-
-# -- Stage 1: private scalar selection --------------------------------------
+# -- Stage 1: private scalar selection (text pipeline) ------------------------
 
 stage_one, stage_two = st.columns(2)
 
 with stage_one:
     with st.container(border=True):
         st.markdown("**Stage 1 — Alice selects a private scalar**")
-        alice_input: int = st.number_input(
-            "Alice's private scalar d_A",
-            min_value=1,
-            max_value=bound,
-            value=int(st.session_state["alice_private"]),
-            key="alice_scalar_input",
-        )
+        # Randomisation mutates the widget-backed key BEFORE the text input
+        # below instantiates, then refreshes via st.rerun() — the only
+        # lifecycle-safe ordering in Streamlit.
         if st.button(
             "Randomise Alice's scalar",
             icon=":material/casino:",
             key="alice_random",
         ):
-            alice_input = exchange.generate_private_scalar()
-            st.session_state["alice_private"] = alice_input
+            random_alice: int = exchange.generate_private_scalar()
+            st.session_state["alice_scalar_text"] = str(random_alice)
             st.rerun()
-        st.session_state["alice_private"] = int(alice_input)
-        st.caption(f"d_A = {st.session_state['alice_private']} (secret)")
+        alice_raw: str = st.text_input(
+            "Alice's private scalar d_A (base-10 or 0x hex)",
+            value=st.session_state["alice_scalar_text"],
+            key="alice_scalar_text",
+        )
+        alice_val: int
+        alice_ok: bool
+        alice_val, alice_ok = parse_integer_text(alice_raw, ALICE_FALLBACK)
+        alice_val = sanitize_scalar(alice_val, curve_p, bound)
+        if not alice_ok:
+            st.caption(
+                f"Unparseable entry; fallback d_A applied and sanitized."
+            )
+        st.session_state["alice_private"] = int(alice_val)
+        st.caption(
+            f"d_A = {st.session_state['alice_private']} "
+            f"(hex: {hex(st.session_state['alice_private'])}) — secret"
+        )
 
 with stage_two:
     with st.container(border=True):
         st.markdown("**Stage 2 — Bob selects a private scalar**")
-        bob_input: int = st.number_input(
-            "Bob's private scalar d_B",
-            min_value=1,
-            max_value=bound,
-            value=int(st.session_state["bob_private"]),
-            key="bob_scalar_input",
-        )
+        # Randomisation mutates the widget-backed key BEFORE the text input
+        # below instantiates, then refreshes via st.rerun() — the only
+        # lifecycle-safe ordering in Streamlit.
         if st.button(
             "Randomise Bob's scalar",
             icon=":material/casino:",
             key="bob_random",
         ):
-            bob_input = exchange.generate_private_scalar()
-            st.session_state["bob_private"] = bob_input
+            random_bob: int = exchange.generate_private_scalar()
+            st.session_state["bob_scalar_text"] = str(random_bob)
             st.rerun()
-        st.session_state["bob_private"] = int(bob_input)
-        st.caption(f"d_B = {st.session_state['bob_private']} (secret)")
+        bob_raw: str = st.text_input(
+            "Bob's private scalar d_B (base-10 or 0x hex)",
+            value=st.session_state["bob_scalar_text"],
+            key="bob_scalar_text",
+        )
+        bob_val: int
+        bob_ok: bool
+        bob_val, bob_ok = parse_integer_text(bob_raw, BOB_FALLBACK)
+        bob_val = sanitize_scalar(bob_val, curve_p, bound)
+        if not bob_ok:
+            st.caption(
+                f"Unparseable entry; fallback d_B applied and sanitized."
+            )
+        st.session_state["bob_private"] = int(bob_val)
+        st.caption(
+            f"d_B = {st.session_state['bob_private']} "
+            f"(hex: {hex(st.session_state['bob_private'])}) — secret"
+        )
 
 if st.button(
     "Continue to public key derivation",
@@ -274,6 +418,8 @@ if st.button(
     st.rerun()
 
 # -- Stage 2: public point derivation ----------------------------------------
+
+step: int = int(st.session_state["ecdh_step"])
 
 if step >= 2:
     d_a: int = int(st.session_state["alice_private"])
@@ -362,5 +508,6 @@ st.divider()
 st.caption(
     "Educational demonstration only. Toy-field scalars are trivially "
     "brute-forceable; production systems must use standardised curves "
-    "with ≥256-bit primes."
+    "with ≥256-bit primes. All numeric entries accept base-10 or 0x-hex "
+    "and are reduced modulo the active field characteristic."
 )
